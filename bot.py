@@ -1,11 +1,12 @@
 import os
 import json
+import time
 import random
 import threading
 from io import BytesIO
 from flask import Flask
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from telebot.apihelper import ApiTelegramException
 
 # --- FAKE WEB SERVER TO KEEP RENDER HAPPY ---
@@ -46,6 +47,24 @@ def save_db():
 # Load data when bot turns on
 load_db()
 
+# --- BACKGROUND EXPIRATION TIMER ---
+def expiration_checker():
+    """Runs in the background and auto-closes polls when time is up."""
+    while True:
+        time.sleep(60) # Check every 60 seconds
+        current_time = time.time()
+        expired_chats = []
+        
+        with db_lock:
+            for chat_id, poll in active_polls.items():
+                if poll.get('expires_at') and poll['expires_at'] != 0:
+                    if current_time >= poll['expires_at']:
+                        expired_chats.append(chat_id)
+        
+        # Auto-close expired polls
+        for chat_id in expired_chats:
+            end_poll_logic(chat_id, auto_expired=True)
+
 # --- HELPERS ---
 
 def is_subscribed(user_id):
@@ -64,16 +83,28 @@ def force_sub_markup():
     markup.add(InlineKeyboardButton("✅ I Have Subscribed", callback_data="check_sub"))
     return markup
 
+def main_menu():
+    """Generates the permanent bottom keyboard buttons."""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row(KeyboardButton("📝 Create Poll"), KeyboardButton("👀 View Progress"))
+    markup.row(KeyboardButton("🛑 End Poll"), KeyboardButton("🗑 Cancel Setup/Poll"))
+    return markup
+
 def generate_poll_markup(chat_id):
     poll = active_polls[chat_id]
     markup = InlineKeyboardMarkup()
     
     if poll.get('mode') == 'random':
-        text = f"🎲 Join Randomly ({len(poll['voted'])}/{poll['total_capacity']})"
+        text = f"🎲 Join Randomly ({len(poll['voted'])})"
         markup.add(InlineKeyboardButton(text, callback_data="vote_random"))
     else:
         for i, group in enumerate(poll['groups']):
-            status = "🔴 Full" if len(group['members']) >= group['limit'] else f"🟢 {len(group['members'])}/{group['limit']}"
+            if group['limit'] == 0:
+                # 0 means Unlimited
+                status = f"🟢 {len(group['members'])} Votes"
+            else:
+                status = "🔴 Full" if len(group['members']) >= group['limit'] else f"🟢 {len(group['members'])}/{group['limit']}"
+            
             text = f"{group['name']} - {status}"
             markup.add(InlineKeyboardButton(text, callback_data=f"vote_{i}"))
             
@@ -83,18 +114,30 @@ def get_poll_text(chat_id):
     poll = active_polls[chat_id]
     mode_text = "🎲 **Random Assignment Mode**" if poll.get('mode') == 'random' else "🖐 **Manual Selection Mode**"
     
-    text = f"📋 **{poll['title']}**\n{mode_text}\n\n"
-    text += f"Total Votes: {len(poll['voted'])}/{poll['total_capacity']}\n"
+    # Calculate Expiration Text
+    expire_text = ""
+    if poll.get('expires_at') and poll['expires_at'] != 0:
+        hours_left = round((poll['expires_at'] - time.time()) / 3600, 1)
+        expire_text = f"⏳ **Closes automatically in:** {hours_left} hours\n"
+
+    # Calculate Capacity Text
+    cap_text = str(poll['total_capacity']) if poll['total_capacity'] > 0 else "∞ (Unlimited)"
+    
+    text = f"📋 **{poll['title']}**\n{mode_text}\n{expire_text}\n"
+    text += f"Total Votes: {len(poll['voted'])}/{cap_text}\n"
     text += "🔒 *Names are hidden to prevent bias.*\n\n"
     return text
 
 def get_results_text(chat_id):
     poll = active_polls[chat_id]
+    cap_text = str(poll['total_capacity']) if poll['total_capacity'] > 0 else "∞ (Unlimited)"
+    
     text = f"📊 **RESULTS: {poll['title']}**\n"
-    text += f"Total Votes: {len(poll['voted'])}/{poll['total_capacity']}\n\n"
+    text += f"Total Votes: {len(poll['voted'])}/{cap_text}\n\n"
     
     for group in poll['groups']:
-        text += f"🔹 **{group['name']} ({len(group['members'])}/{group['limit']}):**\n"
+        lim_text = "∞" if group['limit'] == 0 else str(group['limit'])
+        text += f"🔹 **{group['name']} ({len(group['members'])}/{lim_text}):**\n"
         if not group['members']:
             text += " - (No members)\n"
         else:
@@ -114,15 +157,12 @@ def send_welcome(message):
     text = (
         "👋 **Welcome to the Advanced Group Maker Bot!**\n\n"
         "I will help you create unbiased group formations.\n\n"
-        "**Available Commands:**\n"
-        "🔹 `/create` - Start the step-by-step poll creator\n"
-        "🔹 `/view` - (Admin) Secretly view current results\n"
-        "🔹 `/end` - (Admin) Close the poll & Export Results\n"
-        "🔹 `/cancel` - Cancel a poll or poll creation"
+        "**Use the menu below to navigate!**"
     )
-    bot.send_message(message.chat.id, text, parse_mode='Markdown')
+    bot.send_message(message.chat.id, text, reply_markup=main_menu(), parse_mode='Markdown')
 
 @bot.message_handler(commands=['create'])
+@bot.message_handler(func=lambda msg: msg.text == "📝 Create Poll")
 def start_setup(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
@@ -132,44 +172,72 @@ def start_setup(message):
         return
 
     if chat_id in active_polls:
-        bot.send_message(chat_id, "⚠️ There is already an active poll here. Use `/end` or `/cancel` first.")
+        bot.send_message(chat_id, "⚠️ There is already an active poll here. Use End or Cancel first.")
         return
 
     setup_sessions[user_id] = {'chat_id': chat_id, 'step': 'title', 'groups': []}
-    msg = bot.send_message(chat_id, "Let's create a poll! 🛠\n\n**Step 1:** What is the Title or Purpose of this poll? (e.g., Robot Project Groups)")
+    msg = bot.send_message(chat_id, "Let's create a poll! 🛠\n\n**Step 1:** What is the Title or Purpose of this poll?")
     bot.register_next_step_handler(msg, process_title)
 
 # --- STEP-BY-STEP CREATION LOGIC ---
 
 def process_title(message):
     user_id = message.from_user.id
-    if user_id not in setup_sessions or message.text == '/cancel':
+    if message.text in ['/cancel', '🗑 Cancel Setup/Poll']:
         bot.send_message(message.chat.id, "Setup cancelled.")
+        if user_id in setup_sessions:
+            del setup_sessions[user_id]
         return
 
     setup_sessions[user_id]['title'] = message.text
     
+    msg = bot.send_message(message.chat.id, "**Step 2:** How many HOURS until this poll auto-expires? (Send `0` for no expiration)")
+    bot.register_next_step_handler(msg, process_expiration)
+
+def process_expiration(message):
+    user_id = message.from_user.id
+    if message.text in ['/cancel', '🗑 Cancel Setup/Poll']:
+        bot.send_message(message.chat.id, "Setup cancelled.")
+        if user_id in setup_sessions:
+            del setup_sessions[user_id]
+        return
+
+    try:
+        hours = float(message.text)
+        if hours > 0:
+            setup_sessions[user_id]['expires_at'] = time.time() + (hours * 3600)
+        else:
+            setup_sessions[user_id]['expires_at'] = 0
+    except ValueError:
+        msg = bot.send_message(message.chat.id, "❌ Please send a valid number (e.g., 24). Try again:")
+        return bot.register_next_step_handler(msg, process_expiration)
+
     # Ask for Manual vs Random mode
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🖐 Users Pick Manually", callback_data="mode_manual"))
     markup.add(InlineKeyboardButton("🎲 Bot Picks Randomly", callback_data="mode_random"))
-    bot.send_message(message.chat.id, "**Step 2:** How should users be assigned?", reply_markup=markup)
+    bot.send_message(message.chat.id, "**Step 3:** How should users be assigned?", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('mode_'))
 def process_mode(call):
     user_id = call.from_user.id
-    if user_id not in setup_sessions: return
+    if user_id not in setup_sessions: 
+        return
     
     mode = call.data.split('_')[1] # 'manual' or 'random'
     setup_sessions[user_id]['mode'] = mode
     
     bot.delete_message(call.message.chat.id, call.message.message_id)
-    msg = bot.send_message(call.message.chat.id, f"Mode set to: **{mode.upper()}**\n\n**Step 3:** How many groups do you want to create? (Send a number, e.g., 3)", parse_mode='Markdown')
+    msg = bot.send_message(call.message.chat.id, f"Mode set to: **{mode.upper()}**\n\n**Step 4:** How many groups do you want to create? (Send a number, e.g., 3)", parse_mode='Markdown')
     bot.register_next_step_handler(msg, process_num_groups)
 
 def process_num_groups(message):
     user_id = message.from_user.id
-    if message.text == '/cancel': return bot.send_message(message.chat.id, "Setup cancelled.")
+    if message.text in ['/cancel', '🗑 Cancel Setup/Poll']:
+        bot.send_message(message.chat.id, "Setup cancelled.")
+        if user_id in setup_sessions:
+            del setup_sessions[user_id]
+        return
 
     if not message.text.isdigit() or int(message.text) < 1:
         msg = bot.send_message(message.chat.id, "❌ Please send a valid number (e.g., 3). Try again:")
@@ -183,19 +251,27 @@ def process_num_groups(message):
 
 def process_group_name(message):
     user_id = message.from_user.id
-    if message.text == '/cancel': return bot.send_message(message.chat.id, "Setup cancelled.")
+    if message.text in ['/cancel', '🗑 Cancel Setup/Poll']:
+        bot.send_message(message.chat.id, "Setup cancelled.")
+        if user_id in setup_sessions:
+            del setup_sessions[user_id]
+        return
 
     setup_sessions[user_id]['temp_name'] = message.text
     
-    msg = bot.send_message(message.chat.id, f"What is the **Member Limit** for '{message.text}'? (Send a number)")
+    msg = bot.send_message(message.chat.id, f"What is the **Member Limit** for '{message.text}'?\n*(Send `0` for Unlimited)*", parse_mode='Markdown')
     bot.register_next_step_handler(msg, process_group_limit)
 
 def process_group_limit(message):
     user_id = message.from_user.id
-    if message.text == '/cancel': return bot.send_message(message.chat.id, "Setup cancelled.")
+    if message.text in ['/cancel', '🗑 Cancel Setup/Poll']:
+        bot.send_message(message.chat.id, "Setup cancelled.")
+        if user_id in setup_sessions:
+            del setup_sessions[user_id]
+        return
 
-    if not message.text.isdigit() or int(message.text) < 1:
-        msg = bot.send_message(message.chat.id, "❌ Limit must be a number. Try again:")
+    if not message.text.isdigit() or int(message.text) < 0:
+        msg = bot.send_message(message.chat.id, "❌ Limit must be 0 or higher. Try again:")
         return bot.register_next_step_handler(msg, process_group_limit)
 
     session = setup_sessions[user_id]
@@ -214,11 +290,16 @@ def process_group_limit(message):
         chat_id = session['chat_id']
         total_cap = sum(g['limit'] for g in session['groups'])
         
+        # If any group is unlimited (0), the total capacity is unlimited (0)
+        if any(g['limit'] == 0 for g in session['groups']):
+            total_cap = 0
+        
         with db_lock:
             active_polls[chat_id] = {
                 'owner': user_id,
                 'title': session['title'],
                 'mode': session['mode'],
+                'expires_at': session.get('expires_at', 0),
                 'groups': session['groups'],
                 'voted': {},
                 'total_capacity': total_cap,
@@ -271,13 +352,17 @@ def handle_vote(call):
 
         # FEATURE: Random Assignment vs Manual
         if call.data == "vote_random":
-            available = [i for i, g in enumerate(poll['groups']) if len(g['members']) < g['limit']]
+            # Find groups that are NOT full (or have unlimited limit == 0)
+            available = [i for i, g in enumerate(poll['groups']) if g['limit'] == 0 or len(g['members']) < g['limit']]
             if not available:
                 return bot.answer_callback_query(call.id, "All groups are full!", show_alert=True)
             group_index = random.choice(available)
         else:
             group_index = int(call.data.split('_')[1])
-            if len(poll['groups'][group_index]['members']) >= poll['groups'][group_index]['limit']:
+            g_limit = poll['groups'][group_index]['limit']
+            
+            # If not unlimited, check if full
+            if g_limit != 0 and len(poll['groups'][group_index]['members']) >= g_limit:
                 return bot.answer_callback_query(call.id, "Group is full! Pick another.", show_alert=True)
 
         # Register Vote
@@ -288,49 +373,93 @@ def handle_vote(call):
     bot.answer_callback_query(call.id, f"Success! You joined {poll['groups'][group_index]['name']}.")
     bot.edit_message_text(text=get_poll_text(chat_id), chat_id=chat_id, message_id=poll['message_id'], reply_markup=generate_poll_markup(chat_id), parse_mode='Markdown')
 
-    if len(poll['voted']) >= poll['total_capacity']:
+    # Notify creator if poll is full (Only if it's not unlimited)
+    if poll['total_capacity'] > 0 and len(poll['voted']) >= poll['total_capacity']:
         bot.send_message(chat_id, f"🎉 **Attention:** The poll '{poll['title']}' is now full! The creator can type `/end` to reveal the groups.", parse_mode='Markdown')
+
 
 # --- POLL MANAGEMENT COMMANDS ---
 
+def end_poll_logic(chat_id, auto_expired=False):
+    """Shared function to end a poll, whether by user command or timer."""
+    with db_lock:
+        if chat_id not in active_polls:
+            return
+            
+        poll = active_polls[chat_id]
+        results_text = get_results_text(chat_id)
+        
+        if auto_expired:
+            bot.send_message(chat_id, f"⏳ **AUTO-EXPIRED:** Time is up! Final Results:\n\n{results_text}", parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id, f"🛑 **Poll officially closed by creator.** Final Results:\n\n{results_text}", parse_mode='Markdown')
+            
+        try:
+            bot.edit_message_reply_markup(chat_id, poll['message_id'], reply_markup=None)
+        except Exception:
+            pass
+            
+        # FEATURE: Export results as a text file
+        doc = BytesIO(results_text.replace('*', '').encode('utf-8'))
+        doc.name = f"{poll['title']}_Results.txt"
+        bot.send_document(chat_id, doc, caption="📁 Here is the downloadable text file of the results!")
+
+        del active_polls[chat_id]
+        save_db()
+
 @bot.message_handler(commands=['view'])
+@bot.message_handler(func=lambda msg: msg.text == "👀 View Progress")
 def view_results(message):
     chat_id = message.chat.id
-    if chat_id not in active_polls: return bot.send_message(chat_id, "No active poll here.")
-    if message.from_user.id != active_polls[chat_id]['owner']: return bot.send_message(chat_id, "⛔️ Only the creator can view results.")
+    if chat_id not in active_polls:
+        bot.send_message(chat_id, "No active poll here.")
+        return
+        
+    if message.from_user.id != active_polls[chat_id]['owner']:
+        bot.send_message(chat_id, "⛔️ Only the creator can view results.")
+        return
 
     bot.send_message(chat_id, f"👀 **Current Progress (Poll is still open):**\n\n{get_results_text(chat_id)}", parse_mode='Markdown')
 
 @bot.message_handler(commands=['end'])
+@bot.message_handler(func=lambda msg: msg.text == "🛑 End Poll")
 def end_poll(message):
     chat_id = message.chat.id
-    if chat_id not in active_polls: return bot.send_message(chat_id, "No active poll here.")
-    if message.from_user.id != active_polls[chat_id]['owner']: return bot.send_message(chat_id, "⛔️ Only the creator can end the poll.")
+    if chat_id not in active_polls:
+        bot.send_message(chat_id, "No active poll here.")
+        return
+        
+    if message.from_user.id != active_polls[chat_id]['owner']:
+        bot.send_message(chat_id, "⛔️ Only the creator can end the poll.")
+        return
 
-    results_text = get_results_text(chat_id)
-    bot.send_message(chat_id, f"🛑 **Poll officially closed by creator.** Final Results:\n\n{results_text}", parse_mode='Markdown')
-    bot.edit_message_reply_markup(chat_id, active_polls[chat_id]['message_id'], reply_markup=None)
-    
-    # FEATURE: Export results as a text file
-    doc = BytesIO(results_text.replace('*', '').encode('utf-8'))
-    doc.name = f"{active_polls[chat_id]['title']}_Results.txt"
-    bot.send_document(chat_id, doc, caption="📁 Here is the downloadable text file of the results!")
-
-    with db_lock:
-        del active_polls[chat_id]
-        save_db()
+    end_poll_logic(chat_id, auto_expired=False)
 
 @bot.message_handler(commands=['cancel'])
+@bot.message_handler(func=lambda msg: msg.text == "🗑 Cancel Setup/Poll")
 def cancel_poll(message):
     chat_id = message.chat.id
-    if chat_id in active_polls and message.from_user.id == active_polls[chat_id]['owner']:
-        bot.edit_message_reply_markup(chat_id, active_polls[chat_id]['message_id'], reply_markup=None)
-        
+    user_id = message.from_user.id
+    
+    # Cancel if they are in setup mode
+    if user_id in setup_sessions:
+        del setup_sessions[user_id]
+        bot.send_message(chat_id, "Setup cancelled.")
+        return
+
+    # Cancel if they have an active poll
+    if chat_id in active_polls and user_id == active_polls[chat_id]['owner']:
         with db_lock:
+            try:
+                bot.edit_message_reply_markup(chat_id, active_polls[chat_id]['message_id'], reply_markup=None)
+            except Exception:
+                pass
             del active_polls[chat_id]
             save_db()
             
         bot.send_message(chat_id, "🗑 Poll deleted.", parse_mode='Markdown')
+    else:
+        bot.send_message(chat_id, "No active poll or you are not the creator.")
 
 # --- FALLBACK / UNDEFINED COMMANDS (ROADMAP) ---
 
@@ -341,10 +470,9 @@ def undefined_commands(message):
             "🤖 **Bot Roadmap & Instructions**\n\n"
             "I didn't understand that command. Here is how to use me:\n\n"
             "1️⃣ **Join the Channel:** You must join our channel to use the bot.\n"
-            "2️⃣ **Create a Poll:** Type `/create` and I will ask you step-by-step for the Title, Mode, Groups, and Limits.\n"
-            "3️⃣ **Monitor:** Type `/view` to secretly check who has joined which group.\n"
-            "4️⃣ **Finish:** Type `/end` to lock the poll and show everyone the results.\n\n"
-            "Type `/create` to start!"
+            "2️⃣ **Create a Poll:** Click `📝 Create Poll` in the menu below.\n"
+            "3️⃣ **Monitor:** Click `👀 View Progress` to secretly check who has joined.\n"
+            "4️⃣ **Finish:** Click `🛑 End Poll` to lock the poll and show everyone the results.\n\n"
         )
         bot.send_message(message.chat.id, roadmap, parse_mode='Markdown')
 
@@ -355,5 +483,11 @@ def run_bot():
     bot.polling(non_stop=True)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
+    # Start the expiration checker in the background
+    threading.Thread(target=expiration_checker, daemon=True).start()
+    
+    # Start the bot on a separate background thread
+    threading.Thread(target=run_bot, daemon=True).start()
+    
+    # Start the fake web server so Render doesn't shut down the app
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
