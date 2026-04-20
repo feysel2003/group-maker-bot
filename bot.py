@@ -1,9 +1,19 @@
+import os
+import threading
+from flask import Flask
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiTelegramException
 
+# --- FAKE WEB SERVER TO KEEP RENDER HAPPY ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running beautifully on Render!"
+
 # --- CONFIGURATION ---
-TOKEN = '8664807029:AAFWbB2EYSdY90UiqdZjQ2ghYou8Qdjb1tk'
+TOKEN = '8664807029:AAGpRARI-ZkBJl7gND1O3gLaA4hh7mXLcVE'  # Put your bot token here
 CHANNEL_USERNAME = '@deepseek_deepAi' # Must include the @ 
 CHANNEL_URL = 'https://t.me/deepseek_deepAi'
 
@@ -262,5 +272,14 @@ def undefined_commands(message):
         )
         bot.send_message(message.chat.id, roadmap, parse_mode='Markdown')
 
-print("Great Bot System Running...")
-bot.polling()
+
+# --- STARTING THE BOT & WEB SERVER (FOR RENDER) ---
+def run_bot():
+    print("Great Bot System Running...")
+    bot.polling(non_stop=True)
+
+if __name__ == "__main__":
+    # Start the bot on a separate background thread
+    threading.Thread(target=run_bot).start()
+    # Start the fake web server so Render doesn't shut down the app
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
